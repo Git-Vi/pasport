@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """DP «Документ» Мюнхен — монитор слотов через реальный Chrome на GitHub Actions.
 
-Почему так: Cloudflare режет наш домашний IP и не пропускает POST, а у раннера
-GitHub IP чистый. POST делает не скрипт, а сама страница (Chrome), поэтому знать
-тело запроса не нужно: мы перехватываем ответ приложения `{"days": [...]}`.
-
-Логика:
-  1) Chrome открывает страницу очереди (ждём, пока пройдёт челлендж Cloudflare).
-  2) Перехватываем POST-ответ на /solutions/e-queue со стороны страницы.
-  3) Выбираем услугу service=4 (значение «Закордонний паспорт та (або) ID-картка»).
-  4) Ждём JSON: [] → мест нет; [{date, allowedJobCount}] → места есть → Telegram.
+Две проверки в одном прогоне:
+  1) plain_check()   — обычный HTTP-запрос: что именно отдаёт сайт раннеру (статус, длина, челлендж).
+  2) browser_check() — реальный Chrome: ждёт прохождения Cloudflare, выбирает услугу и
+     перехватывает ответ приложения {"days": [...]} (тело запроса знать не нужно).
 
 Секреты репозитория: TG_DELIVERY (токен бота), TG_TARGET (id чата).
 Ничего не бронирует и персональные данные не отправляет.
@@ -20,6 +15,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -92,31 +88,63 @@ def save_state(state):
         print(f"! не смог сохранить состояние: {exc}")
 
 
-def main():
+def plain_check():
+    """Что отдаёт сайт обычному HTTP-клиенту с этого раннера."""
+    info = {}
+    req = urllib.request.Request(
+        PAGE,
+        headers={
+            "user-agent": UA,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "uk-UA,uk;q=0.9,en-US;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            body = resp.read()
+            text = body.decode("utf-8", errors="ignore")
+            info["http_status"] = resp.status
+            info["cf_mitigated"] = resp.headers.get("cf-mitigated", "")
+            info["len"] = len(body)
+            m = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
+            info["title"] = (m.group(1).strip()[:80] if m else "")
+            info["challenge"] = bool(CHALLENGE_TITLE.search(text))
+            info["csrf"] = bool(re.search(r"csrf&quot;:&quot;([a-f0-9]{16,})", text))
+            info["head"] = text[:180].replace("\n", " ")
+    except urllib.error.HTTPError as exc:
+        info["http_status"] = exc.code
+        info["cf_mitigated"] = (exc.headers.get("cf-mitigated", "") if exc.headers else "")
+        info["error"] = f"HTTPError {exc.code}"
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+def browser_check():
+    """Chrome: ждём Cloudflare, выбираем услугу, перехватываем ответ приложения."""
+    out = {"days": None, "title": "", "dates_dom": [], "busy": False, "diag": {}}
     try:
         from playwright.sync_api import sync_playwright  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
-        print(f"СБОЙ: playwright недоступен ({exc})")
-        return 0
+        out["diag"]["playwright"] = f"недоступен: {exc}"
+        return out
 
     captured = []
-    title = ""
-    info = {}
-    last_err = ""
-
     with sync_playwright() as pw:
         launch_args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
         browser = None
+        last_err = ""
         for kwargs in ({"channel": "chrome"}, {}):
             try:
                 browser = pw.chromium.launch(headless=True, args=launch_args, **kwargs)
-                info["channel"] = kwargs.get("channel", "chromium")
+                out["diag"]["channel"] = kwargs.get("channel", "chromium")
                 break
             except Exception as exc:  # noqa: BLE001
-                last_err = exc
+                last_err = f"{type(exc).__name__}: {exc}"
         if browser is None:
-            print(f"СБОЙ: Chrome/Chromium не запустился ({last_err})")
-            return 0
+            out["diag"]["launch_error"] = last_err
+            return out
+
         context = browser.new_context(
             user_agent=UA,
             locale="uk-UA",
@@ -138,73 +166,90 @@ def main():
         page.on("response", on_response)
 
         try:
-            page.goto(PAGE, wait_until="domcontentloaded", timeout=120000)
+            resp = page.goto(PAGE, wait_until="domcontentloaded", timeout=120000)
+            if resp is not None:
+                out["diag"]["goto_status"] = resp.status
+                out["diag"]["goto_cf"] = resp.headers.get("cf-mitigated", "")
+                out["diag"]["goto_ctype"] = (resp.headers.get("content-type") or "")[:60]
+                try:
+                    out["diag"]["goto_len"] = len(resp.body())
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as exc:  # noqa: BLE001
-            print(f"СБОЙ: не открылась страница ({type(exc).__name__}: {exc})")
-            browser.close()
-            return 0
+            out["diag"]["goto_error"] = f"{type(exc).__name__}: {exc}"
 
-        deadline = time.time() + 120
+        deadline = time.time() + 90
         while time.time() < deadline:
-            title = page.title() or ""
-            if title and not CHALLENGE_TITLE.search(title):
+            out["title"] = page.title() or ""
+            if out["title"] and not CHALLENGE_TITLE.search(out["title"]):
                 break
             time.sleep(3)
 
-        if not title or CHALLENGE_TITLE.search(title):
-            print(f"СБОЙ: Cloudflare челлендж не пройден (title={title!r}) — не «нет мест»")
-            save_state({**load_state(), "state": "blocked"})
-            browser.close()
-            return 0
-
-        page.wait_for_timeout(4000)
-
-        # выбор услуги — как делает человек
         try:
-            page.evaluate(
-                """(v) => {
-                    const s = document.querySelector('#service');
-                    if (!s) return 'no';
-                    s.value = v;
-                    s.dispatchEvent(new Event('input', { bubbles: true }));
-                    s.dispatchEvent(new Event('change', { bubbles: true }));
-                    return s.value;
-                }""",
-                SERVICE_VALUE,
-            )
-            info["service_set"] = "value=" + SERVICE_VALUE
+            out["diag"]["dom_len"] = page.evaluate("() => document.documentElement.outerHTML.length")
+            out["diag"]["url_now"] = page.url
+            out["diag"]["body_head"] = (
+                page.evaluate("() => document.body ? document.body.innerText.slice(0,150) : ''") or ""
+            ).replace("\n", " ")
         except Exception as exc:  # noqa: BLE001
-            info["service_set"] = f"ошибка: {exc}"
+            out["diag"]["dom_error"] = f"{type(exc).__name__}: {exc}"
 
-        deadline = time.time() + 45
-        days = None
-        while time.time() < deadline:
-            for body in captured:
-                try:
-                    parsed = json.loads(body)
-                except Exception:  # noqa: BLE001
-                    continue
-                if isinstance(parsed, dict) and isinstance(parsed.get("days"), list):
-                    days = parsed["days"]
-                    break
-            if days is not None:
-                break
-            time.sleep(2)
-
-        if days is None:
+        if out["title"] and not CHALLENGE_TITLE.search(out["title"]):
+            page.wait_for_timeout(4000)
             try:
-                info["busy_body"] = page.evaluate(
-                    """() => /всі місця зайняті|спробуйте записатись пізніше/i.test(document.body.innerText)"""
+                page.evaluate(
+                    """(v) => { const s = document.querySelector('#service');
+                        if (!s) return 'no'; s.value = v;
+                        s.dispatchEvent(new Event('input', { bubbles: true }));
+                        s.dispatchEvent(new Event('change', { bubbles: true })); return s.value; }""",
+                    SERVICE_VALUE,
                 )
-                info["date_options"] = page.evaluate(
-                    """() => { const s = document.querySelector('#date');
-                        return s ? Array.from(s.options).map(o => (o.textContent||'').trim())
-                            .filter(x => x && !/обрати/i.test(x)) : []; }"""
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        browser.close()
+                out["diag"]["service_set"] = SERVICE_VALUE
+            except Exception as exc:  # noqa: BLE001
+                out["diag"]["service_set"] = f"ошибка: {exc}"
 
+            deadline = time.time() + 40
+            while time.time() < deadline and out["days"] is None:
+                for body in captured:
+                    try:
+                        parsed = json.loads(body)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if isinstance(parsed, dict) and isinstance(parsed.get("days"), list):
+                        out["days"] = parsed["days"]
+                        break
+                if out["days"] is None:
+                    time.sleep(2)
+
+            if out["days"] is None:
+                try:
+                    out["busy"] = bool(page.evaluate(
+                        "() => /всі місця зайняті|спробуйте записатись пізніше/i.test(document.body.innerText)"
+                    ))
+                    out["dates_dom"] = page.evaluate(
+                        """() => { const s = document.querySelector('#date');
+                            return s ? Array.from(s.options).map(o => (o.textContent||'').trim())
+                                .filter(x => x && !/обрати/i.test(x)) : []; }"""
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        browser.close()
+    return out
+
+
+def main():
+    plain = plain_check()
+    print("PLAIN: " + json.dumps(plain, ensure_ascii=False))
+
+    browser = browser_check()
+    print("BROWSER: " + json.dumps(
+        {"title": browser["title"], "days": browser["days"], "busy": browser["busy"],
+         "dates_dom": browser["dates_dom"], "diag": browser["diag"]},
+        ensure_ascii=False,
+    ))
+
+    days = browser["days"]
     dates = []
     seats = 0
     for day in days or []:
@@ -214,9 +259,8 @@ def main():
         count = day.get("allowedJobCount", day.get("slots"))
         if isinstance(count, int):
             seats += count
-
-    if days is None and info.get("date_options"):
-        dates = list(dict.fromkeys(info["date_options"]))
+    if not dates and browser["dates_dom"]:
+        dates = list(dict.fromkeys(browser["dates_dom"]))
 
     state = load_state()
     if dates:
@@ -225,7 +269,6 @@ def main():
         if seats:
             lines.append(f"🗂 Всього місць у відповіді: {seats}")
         lines += [f"🕐 Перевірено: {stamp()}", "", f"👉 {PAGE}"]
-
         last = state.get("last_alert_utc", "")
         cooled = True
         if last:
@@ -242,14 +285,17 @@ def main():
         else:
             print(f"МЕСТА ЕСТЬ ({', '.join(dates)}), но кулдаун ещё не истёк")
         state["state"] = "open"
-    elif days is not None:
-        print(f"Мест нет (ответ приложения days=[]), проверено {stamp()}")
+    elif days is not None or browser["busy"]:
+        print(f"Мест нет (ответ приложения или текст страницы), проверено {stamp()}")
         state["state"] = "all-taken"
-    elif info.get("busy_body"):
-        print(f"Мест нет (страница показала «всі місця зайняті»), проверено {stamp()}")
-        state["state"] = "all-taken"
+    elif plain.get("challenge") or plain.get("http_status") in (403, 429):
+        print(
+            f"СБОЙ: сайт не пускает раннер (HTTP {plain.get('http_status')}, "
+            f"cf-mitigated='{plain.get('cf_mitigated', '')}') — не «нет мест»"
+        )
+        state["state"] = "blocked"
     else:
-        print(f"НЕОПРЕДЕЛЁННО: {json.dumps(info, ensure_ascii=False)} — ничего не отправляю")
+        print("НЕОПРЕДЕЛЁННО: страница без заголовка, данные не получены — не «нет мест»")
         state["state"] = "unknown"
 
     save_state(state)
